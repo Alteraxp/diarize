@@ -4,85 +4,124 @@ Extracts 256-dimensional speaker embeddings from audio segments detected
 by VAD.  Long segments are split with a sliding window so that each
 window produces its own embedding, improving clustering granularity.
 """
-
 from __future__ import annotations
 
-import logging
 import os
+import io
 import tempfile
 from pathlib import Path
+from multiprocessing import Pool
+from typing import List, Tuple
 
 import numpy as np
 import soundfile as sf
 
-from .utils import SpeechSegment, SubSegment
+from diarize.utils import SpeechSegment, SubSegment, logger
 
-logger = logging.getLogger(__name__)
+# ---- CONFIG ----
+NUM_WORKERS = 4
+BATCH_SIZE = 8
 
-__all__ = ["extract_embeddings"]
-
-# ── Constants ────────────────────────────────────────────────────────────────
-
-#: Minimum segment duration for embedding extraction (seconds).
-#: Segments shorter than this are skipped during embedding extraction
-#: and later assigned the nearest speaker label.
-MIN_SEGMENT_DURATION: float = 0.4
-
-#: Sliding window length for splitting long segments (seconds).
-EMBEDDING_WINDOW: float = 1.2
-
-#: Sliding window step size (seconds).  Overlap = WINDOW − STEP.
-EMBEDDING_STEP: float = 0.6
+MIN_SEGMENT_DURATION = 0.5
+EMBEDDING_WINDOW = 1.5
+EMBEDDING_STEP = 0.75
 
 
-def extract_embeddings(
-    audio_path: str | Path,
-    speech_segments: list[SpeechSegment],
-) -> tuple[np.ndarray, list[SubSegment]]:
-    """Extract 256-dim speaker embeddings using WeSpeaker ResNet34-LM (ONNX).
+# ---- GLOBALS (per worker) ----
+_model = None
+_audio_data = None
+_sr = None
 
-    Long segments are split using a sliding window for more accurate
-    clustering.  Each window produces its own embedding.
 
-    Args:
-        audio_path: Path to the audio file (wav, mp3, flac, etc.).
-        speech_segments: Speech segments detected by VAD.
-
-    Returns:
-        A ``(embeddings, subsegments)`` tuple where:
-
-        -   **embeddings** --- ``np.ndarray`` of shape ``(N, 256)`` with
-            raw speaker embeddings (not yet L2-normalised; normalisation
-            is applied later during clustering).
-        -   **subsegments** --- list of :class:`SubSegment` objects that
-            record the time window and parent segment index for each
-            embedding row.
-
-    Raises:
-        FileNotFoundError: If *audio_path* does not exist.
-
-    Example::
-
-        from diarize.vad import run_vad
-        from diarize.embeddings import extract_embeddings
-
-        segments = run_vad("meeting.wav")
-        embeddings, subs = extract_embeddings("meeting.wav", segments)
-        print(embeddings.shape)  # (N, 256)
-    """
+# ---- INITIALIZER (runs once per worker) ----
+def _init_worker(audio_data, sr):
+    global _model, _audio_data, _sr
     import wespeakerruntime as wespeaker_rt
 
-    logger.info("Extracting speaker embeddings (WeSpeaker ResNet34-LM, 256-dim)...")
+    _model = wespeaker_rt.Speaker(lang="en")
+    _audio_data = audio_data
+    _sr = sr
+    
 
-    model = wespeaker_rt.Speaker(lang="en")
+# ---- WORKER FUNCTION ----
+def _process_batch(batch):
+    """Process a batch tasks"""
+    """Each task processes a window → extract embedding."""
+    global _model, _audio_data, _sr
+    results = []
 
-    # Load full audio for segment slicing
+    for win_start, win_end, parent_idx in batch:
+        # Each process loads its own model (safe for multiprocessing)
+        # model = wespeaker_rt.Speaker(lang="en")
+
+        try:
+            start_sample = int(win_start * _sr)
+            end_sample = int(win_end * _sr)
+            segment_audio = _audio_data[start_sample:end_sample]
+
+            import tempfile
+            tmp_path = None
+            # Write temp wav (required by wespeaker runtime)
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                tmp_path = tmp.name
+                sf.write(tmp_path, segment_audio, _sr)
+            # buf = io.BytesIO()
+            # sf.write(buf, segment_audio, sr, format="WAV")
+            # buf.seek(0)
+
+            emb = _model.extract_embedding(tmp_path)
+
+            if emb is not None:
+                if emb.ndim == 2:
+                    emb = emb[0]
+
+                results.append((
+                    emb,
+                    SubSegment(
+                        start=win_start,
+                        end=win_end,
+                        parent_idx=parent_idx,
+                    )
+                ))
+                #
+                # return emb, SubSegment(
+                #     start=win_start,
+                #     end=win_end,
+                #     parent_idx=parent_idx,
+                # )
+
+        except Exception:
+            continue
+
+    return results
+
+
+# ---- HELPER: CHUNK TASKS ----
+def _chunkify(lst, n):
+    return [lst[i:i + n] for i in range(0, len(lst), n)]
+
+
+# ---- MAIN FUNCTION ----
+def extract_embeddings(
+    audio_path: str | Path,
+    speech_segments: List[SpeechSegment],
+) -> Tuple[np.ndarray, List[SubSegment]]:
+    """Extract 256-dim speaker embeddings using multiprocessing."""
+
+    logger.info("Extracting speaker embeddings (multi-core enabled)...")
+
+    # 🔥 IMPORTANT: prevent oversubscription
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+
+    # Load full audio
     audio_data, sr = sf.read(str(audio_path))
     if audio_data.ndim > 1:
-        audio_data = audio_data.mean(axis=1)  # stereo → mono
+        audio_data = audio_data.mean(axis=1)
 
-    embeddings: list[np.ndarray] = []
-    subsegments: list[SubSegment] = []
+    # ---- PREPARE TASKS ----
+    tasks = []
 
     for idx, seg in enumerate(speech_segments):
         seg_duration = seg.duration
@@ -90,11 +129,11 @@ def extract_embeddings(
         if seg_duration < MIN_SEGMENT_DURATION:
             continue
 
-        # Split long segments with a sliding window
+        # Create windows
         if seg_duration <= EMBEDDING_WINDOW * 1.5:
             windows = [(seg.start, seg.end)]
         else:
-            windows: list[tuple[float, float]] = []
+            windows = []
             win_start = seg.start
             while win_start + MIN_SEGMENT_DURATION < seg.end:
                 win_end = min(win_start + EMBEDDING_WINDOW, seg.end)
@@ -102,41 +141,42 @@ def extract_embeddings(
                 win_start += EMBEDDING_STEP
 
         for win_start, win_end in windows:
-            start_sample = int(win_start * sr)
-            end_sample = int(win_end * sr)
-            segment_audio = audio_data[start_sample:end_sample]
+            tasks.append((win_start, win_end, idx))
 
-            tmp_path: str | None = None
-            try:
-                # wespeakerruntime accepts file paths — write segment to a temp wav
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                    tmp_path = tmp.name
-                    sf.write(tmp_path, segment_audio, sr)
+    if not tasks:
+        return np.empty((0, 256), dtype=np.float32), []
 
-                emb = model.extract_embedding(tmp_path)
-            except Exception:
-                logger.debug(
-                    "Embedding extraction failed for window %.2f-%.2f",
-                    win_start,
-                    win_end,
-                )
-                continue
-            finally:
-                if tmp_path is not None:
-                    try:
-                        os.unlink(tmp_path)
-                    except OSError:
-                        pass
+    # ---- BATCH TASKS ----
+    batched_tasks = _chunkify(tasks, BATCH_SIZE)
 
-            if emb is not None:
-                if emb.ndim == 2:
-                    emb = emb[0]
+    logger.info(
+        "Processing %d windows in %d batches using %d workers...",
+        len(tasks), len(batched_tasks), NUM_WORKERS
+    )
+    # logger.info("Processing %d windows using %d workers...", len(tasks), NUM_WORKERS)
+
+    # ---- MULTIPROCESSING ----
+    with Pool(
+            NUM_WORKERS,
+            initializer=_init_worker,
+            initargs=(audio_data,sr)
+    ) as pool:
+        results = pool.imap_unordered(_process_batch, batched_tasks, chunksize=1)
+
+        # ---- COLLECT RESULTS ----
+        embeddings: List[np.ndarray] = []
+        subsegments: List[SubSegment] = []
+
+        for batch in results:
+            for emb, subseg in batch:
                 embeddings.append(emb)
-                subsegments.append(SubSegment(start=win_start, end=win_end, parent_idx=idx))
+                subsegments.append(subseg)
 
     if not embeddings:
         return np.empty((0, 256), dtype=np.float32), []
 
-    X = np.stack(embeddings)  # (N, 256)
+    X = np.stack(embeddings)
+
     logger.info("Extracted %d embeddings (dim=%d)", X.shape[0], X.shape[1])
+
     return X, subsegments
