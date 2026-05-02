@@ -6,7 +6,15 @@ window produces its own embedding, improving clustering granularity.
 """
 from __future__ import annotations
 
+# 🔥 IMPORTANT: prevent oversubscription
 import os
+
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+
 import io
 import tempfile
 from pathlib import Path
@@ -19,8 +27,8 @@ import soundfile as sf
 from diarize.utils import SpeechSegment, SubSegment, logger
 
 # ---- CONFIG ----
-NUM_WORKERS = 4
-BATCH_SIZE = 8
+_DEFAULT_NUM_WORKERS = 4
+_DEFAULT_BATCH_SIZE = 8
 
 MIN_SEGMENT_DURATION = 0.5
 EMBEDDING_WINDOW = 1.5
@@ -52,15 +60,14 @@ def _process_batch(batch):
 
     for win_start, win_end, parent_idx in batch:
         # Each process loads its own model (safe for multiprocessing)
-        # model = wespeaker_rt.Speaker(lang="en")
 
+        tmp_path = None
         try:
             start_sample = int(win_start * _sr)
             end_sample = int(win_end * _sr)
             segment_audio = _audio_data[start_sample:end_sample]
 
             import tempfile
-            tmp_path = None
             # Write temp wav (required by wespeaker runtime)
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                 tmp_path = tmp.name
@@ -83,15 +90,15 @@ def _process_batch(batch):
                         parent_idx=parent_idx,
                     )
                 ))
-                #
-                # return emb, SubSegment(
-                #     start=win_start,
-                #     end=win_end,
-                #     parent_idx=parent_idx,
-                # )
 
         except Exception:
             continue
+        finally:
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
     return results
 
@@ -105,15 +112,25 @@ def _chunkify(lst, n):
 def extract_embeddings(
     audio_path: str | Path,
     speech_segments: List[SpeechSegment],
+    *,
+    num_workers: int = _DEFAULT_NUM_WORKERS,
+    batch_size: int = _DEFAULT_BATCH_SIZE,
 ) -> Tuple[np.ndarray, List[SubSegment]]:
-    """Extract 256-dim speaker embeddings using multiprocessing."""
+    """Extract 256-dim speaker embeddings using a multiprocessing pool.
+
+    Args:
+        audio_path: Path to the audio file already loaded by the caller.
+        speech_segments: VAD output to embed.
+        num_workers: Number of worker processes for parallel extraction.
+        batch_size: Number of windows dispatched to each worker per task.
+
+    Returns:
+        Tuple of ``(embeddings, subsegments)`` where *embeddings* is an
+        ``(N, 256)`` float32 array and *subsegments* is the aligned list
+        of :class:`SubSegment` objects.
+    """
 
     logger.info("Extracting speaker embeddings (multi-core enabled)...")
-
-    # 🔥 IMPORTANT: prevent oversubscription
-    os.environ["OMP_NUM_THREADS"] = "1"
-    os.environ["OPENBLAS_NUM_THREADS"] = "1"
-    os.environ["MKL_NUM_THREADS"] = "1"
 
     # Load full audio
     audio_data, sr = sf.read(str(audio_path))
@@ -147,17 +164,16 @@ def extract_embeddings(
         return np.empty((0, 256), dtype=np.float32), []
 
     # ---- BATCH TASKS ----
-    batched_tasks = _chunkify(tasks, BATCH_SIZE)
+    batched_tasks = _chunkify(tasks, batch_size)
 
     logger.info(
         "Processing %d windows in %d batches using %d workers...",
-        len(tasks), len(batched_tasks), NUM_WORKERS
+        len(tasks), len(batched_tasks), num_workers
     )
-    # logger.info("Processing %d windows using %d workers...", len(tasks), NUM_WORKERS)
 
     # ---- MULTIPROCESSING ----
     with Pool(
-            NUM_WORKERS,
+            num_workers,
             initializer=_init_worker,
             initargs=(audio_data,sr)
     ) as pool:
