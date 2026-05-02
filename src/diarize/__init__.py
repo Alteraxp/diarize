@@ -10,6 +10,9 @@ Example::
     print(result.num_speakers)  # 3
     print(result.segments)      # [Segment(...), ...]
     result.to_rttm("output.rttm")
+
+    # Tune parallelism explicitly:
+    result = diarize("meeting.wav", num_workers=2, batch_size=4)
 """
 
 from __future__ import annotations
@@ -21,7 +24,7 @@ from typing import NamedTuple
 import numpy as np
 
 from .clustering import cluster_speakers, estimate_speakers  # noqa: F401
-from .embeddings import extract_embeddings
+from .embeddings import extract_embeddings, _DEFAULT_NUM_WORKERS, _DEFAULT_BATCH_SIZE
 from .utils import (
     DiarizeResult,
     Segment,
@@ -129,6 +132,8 @@ def diarize(
     min_speakers: int = 1,
     max_speakers: int = 20,
     num_speakers: int | None = None,
+    num_workers: int = _DEFAULT_NUM_WORKERS,
+    batch_size: int = _DEFAULT_BATCH_SIZE,
 ) -> DiarizeResult:
     """Run the full speaker diarization pipeline on an audio file.
 
@@ -146,6 +151,10 @@ def diarize(
         max_speakers: Maximum number of speakers for auto-detection.
         num_speakers: If set, skip auto-detection and use this exact
             number of speakers.
+        num_workers: Number of worker processes for parallel embedding
+            extraction. Defaults to 4.
+        batch_size: Number of embedding windows per worker task.
+            Defaults to 8.
 
     Returns:
         :class:`DiarizeResult` containing segments, speaker info, and
@@ -168,6 +177,10 @@ def diarize(
         raise ValueError(f"max_speakers ({max_speakers}) must be >= min_speakers ({min_speakers})")
     if num_speakers is not None and num_speakers < 1:
         raise ValueError(f"num_speakers must be >= 1, got {num_speakers}")
+    if num_workers < 1:
+        raise ValueError(f"num_workers must be >= 1, got {num_workers}")
+    if batch_size < 1:
+        raise ValueError(f"batch_size must be >= 1, got {batch_size}")
 
     audio_path_str = str(audio_path)
     duration = get_audio_duration(audio_path_str)
@@ -181,7 +194,12 @@ def diarize(
         return DiarizeResult(audio_path=audio_path_str, audio_duration=duration)
 
     # 2. Speaker embeddings
-    embeddings, subsegments = extract_embeddings(audio_path_str, speech_segments)
+    embeddings, subsegments = extract_embeddings(
+        audio_path_str,
+        speech_segments,
+        num_workers=num_workers,
+        batch_size=batch_size,
+    )
     if len(embeddings) == 0:
         logger.warning("Could not extract embeddings from %s", audio_path_str)
         return DiarizeResult(audio_path=audio_path_str, audio_duration=duration)
